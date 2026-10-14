@@ -1,332 +1,381 @@
-"""Observatorio CIS 4.0 — exploration of official published aggregate tables.
-
-No credentials, user uploads or proprietary estimation models are included.
+"""Observatorio CIS 7.0: explorador de resultados agregados publicados.
+No incluye modelos de estimación privados ni ejecuta contenido de Excel.
 """
+import html
 import io
 import re
+import unicodedata
 from pathlib import Path
-
-import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Observatorio CIS", page_icon="📊", layout="wide")
-DATA_DIR = Path(__file__).resolve().parent / "Datos"
-if not DATA_DIR.exists():
-    DATA_DIR = Path(__file__).resolve().parent / "datos"
-DOC_SHEETS = {"Contenidos", "Ficha técnica", "Tabla ponderaciones", "Notas", "Nota estimación", "Estimación de Voto"}
-COLORS = px.colors.qualitative.Safe
+st.set_page_config(page_title='Observatorio CIS', page_icon='📊', layout='wide', initial_sidebar_state='expanded')
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = next((ROOT / n for n in ('Datos','datos') if (ROOT / n).is_dir()), ROOT / 'Datos')
+DOC_SHEETS = {'Contenidos','Ficha técnica','Tabla ponderaciones','Notas','Nota estimación','Estimación de Voto'}
 
-@st.cache_data(show_spinner="Leyendo tablas oficiales…", max_entries=6)
-def parse_study(data: bytes):
-    """Cache only serializable pandas frames/dicts, never ExcelFile objects."""
-    source = io.BytesIO(data)
-    xls = pd.ExcelFile(source)
-    result = {}
+def norm(s):
+    return ''.join(c for c in unicodedata.normalize('NFD',str(s).lower()) if unicodedata.category(c)!='Mn')
+
+def clean(s):
+    return re.sub(r'\s+', ' ', str(s).replace('_x000D_',' ')).strip()
+
+@st.cache_data(max_entries=4, show_spinner='Leyendo el estudio oficial…')
+def parse_study(raw: bytes):
+    xls = pd.ExcelFile(io.BytesIO(raw), engine='openpyxl')
+    output = {}
     for sheet in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
         if sheet in DOC_SHEETS:
-            result[sheet] = {"blocks": [], "raw": df}
             continue
-        starts = [i for i in range(len(df)) if isinstance(df.iat[i, 0], str)
-                  and re.match(r"^Pregunta\s+\S+", df.iat[i, 0].strip(), re.I)]
-        blocks = []
-        for j, start in enumerate(starts):
-            end = starts[j + 1] if j + 1 < len(starts) else len(df)
-            seg = df.iloc[start:end]
-            code = str(df.iat[start, 0]).strip()
-            title = ""
-            for k in range(start + 1, min(start + 5, end)):
-                v = df.iat[k, 0]
-                if isinstance(v, str) and v.strip():
-                    title = v.strip().replace("_x000D_", " ")
-                    break
-            if sheet == "Resultados":
-                header = None
-                col_positions = [1]
-                col_names = ["TOTAL"]
-                first = start + 2
+        df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+        starts = [i for i in range(len(df)) if isinstance(df.iat[i,0],str) and re.match(r'^Pregunta\s+\S+',df.iat[i,0].strip(),re.I)]
+        blocks=[]
+        for j,start in enumerate(starts):
+            end=starts[j+1] if j+1<len(starts) else len(df)
+            code=clean(df.iat[start,0]).replace('Pregunta ','').strip()
+            title=next((clean(df.iat[k,0]) for k in range(start+1,min(start+6,end)) if isinstance(df.iat[k,0],str) and clean(df.iat[k,0])), '')
+            if sheet=='Resultados':
+                positions=[1]; names=['TOTAL']; first=start+2
             else:
-                header = next((k for k in range(start + 1, min(start + 12, end))
-                               if any(str(v).strip().upper() == "TOTAL" for v in df.iloc[k, 1:].tolist()
-                                      if pd.notna(v))), None)
-                if header is None:
+                head=next((k for k in range(start+1,min(start+12,end)) if any(clean(v).upper()=='TOTAL' for v in df.iloc[k,1:].tolist() if pd.notna(v))),None)
+                if head is None: continue
+                positions=[c for c in range(1,len(df.columns)) if pd.notna(df.iat[head,c]) and clean(df.iat[head,c])]
+                names=[clean(df.iat[head,c]) for c in positions]
+                first=head+1
+            records=[]; bases={}
+            for k in range(first,end):
+                label=df.iat[k,0]
+                if not isinstance(label,str) or not clean(label):
+                    if records: break
                     continue
-                col_positions = [c for c in range(1, len(df.columns))
-                                 if pd.notna(df.iat[header, c]) and str(df.iat[header, c]).strip()]
-                col_names = [str(df.iat[header, c]).strip() for c in col_positions]
-                first = header + 1
-            records, bases = [], {}
-            for k in range(first, end):
-                label = df.iat[k, 0]
-                if not isinstance(label, str) or not label.strip():
-                    if records:
-                        break
-                    continue
-                label = label.strip()
-                if label == "(N)":
-                    bases = {name: pd.to_numeric(df.iat[k, c], errors="coerce")
-                             for c, name in zip(col_positions, col_names)}
+                label=clean(label)
+                if label=='(N)':
+                    bases={n:pd.to_numeric(df.iat[k,c],errors='coerce') for c,n in zip(positions,names)}
                     break
-                if label.startswith("Pregunta "):
-                    break
-                record = {"Respuesta": label}
-                for c, name in zip(col_positions, col_names):
-                    record[name] = pd.to_numeric(df.iat[k, c], errors="coerce")
-                if any(pd.notna(record[n]) for n in col_names):
-                    records.append(record)
-            if records:
-                blocks.append({"code": code, "title": title,
-                               "table": pd.DataFrame(records), "bases": bases})
-        result[sheet] = {"blocks": blocks, "raw": None}
-    return result
+                if label.startswith('Pregunta '):break
+                row={'Respuesta':label}
+                for c,n in zip(positions,names): row[n]=pd.to_numeric(df.iat[k,c],errors='coerce')
+                if any(pd.notna(row[n]) for n in names): records.append(row)
+            if records:blocks.append({'code':code,'title':title,'table':pd.DataFrame(records),'bases':bases})
+        if blocks: output[sheet]=blocks
+    return output
 
-
-def find_question(blocks, term):
-    term = term.casefold().strip()
-    return [i for i, b in enumerate(blocks) if term in (b["code"] + " " + b["title"]).casefold()]
-
-
-def selector(study_data, key):
-    sheets = [s for s, value in study_data.items() if value["blocks"]]
-    if not sheets:
-        st.warning("No se han reconocido preguntas en este archivo.")
-        st.stop()
-    default = sheets.index("RV EG23") if "RV EG23" in sheets else 0
-    sheet = st.selectbox("Desglose / hoja", sheets, index=default, key=f"{key}_sheet")
-    blocks = study_data[sheet]["blocks"]
-    query = st.text_input("Buscar pregunta (vivienda, voto, problemas, confianza…)", key=f"{key}_query")
-    hits = find_question(blocks, query)
-    if not hits:
-        st.info("No hay coincidencias para esa búsqueda.")
-        st.stop()
-    chosen = st.selectbox("Pregunta", hits,
-                          format_func=lambda i: f'{blocks[i]["code"]} — {blocks[i]["title"][:160]}',
-                          key=f"{key}_question")
-    b = blocks[chosen]
-    st.caption(f'{b["code"]} · {b["title"]}')
-    return sheet, b
-
-
-def group_selector(b, key, limit=6):
-    cols = [c for c in b["table"].columns if c != "Respuesta"]
-    defaults = [c for c in ["TOTAL", "PSOE", "PP", "VOX", "Sumar"] if c in cols]
-    return st.multiselect("Grupos que quieres comparar", cols, default=(defaults or cols[:min(limit, len(cols))]), key=key)
-
-
-def numeric_view(b, cols):
-    v = b["table"][["Respuesta"] + cols].copy()
-    for c in cols:
-        v[c] = pd.to_numeric(v[c], errors="coerce")
-    return v
-
-
-def plot_stacked(view, groups, question, normalize):
-    labels = view["Respuesta"].astype(str).tolist()
-    vals = view[groups].fillna(0).clip(lower=0)
-    totals = vals.sum(axis=0)
-    if normalize:
-        # Normalize only if response categories plausibly form a single-choice partition.
-        if not all(97 <= float(t) <= 103 for t in totals if t > 0):
-            st.warning("Las respuestas no suman aproximadamente 100 %. Puede ser una pregunta múltiple o una tabla con otra base. No se normaliza automáticamente.")
-            normalize = False
-    fig = go.Figure()
-    for i, label in enumerate(labels):
-        y = [(float(vals.at[i, g]) / float(totals[g]) * 100 if normalize and totals[g] else float(vals.at[i, g])) for g in groups]
-        fig.add_trace(go.Bar(name=label[:75], y=groups, x=y, orientation="h",
-                             marker_color=COLORS[i % len(COLORS)],
-                             hovertemplate="%{y}: %{x:.1f}%<extra>" + label[:75] + "</extra>"))
-    fig.update_layout(barmode="stack", xaxis_title="Porcentaje publicado (%)", yaxis_title="",
-                      legend_title="Respuesta", height=max(360, 75 * len(groups) + 140),
-                      margin=dict(l=10, r=10, t=30, b=30))
-    if normalize:
-        fig.update_xaxes(range=[0, 100])
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def plot_heatmap(view, groups):
-    m = view.set_index("Respuesta")[groups].T
-    m = m.loc[:, m.notna().any(axis=0)]
-    if m.empty:
-        st.warning("No hay porcentajes numéricos para mostrar.")
-        return
-    fig = px.imshow(m, aspect="auto", color_continuous_scale="Blues", text_auto=".1f",
-                    labels={"x": "Respuesta", "y": "Grupo", "color": "%"})
-    fig.update_layout(height=max(360, len(groups) * 65 + 180),
-                      margin=dict(l=10, r=10, t=25, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def csv_button(df, name):
-    st.download_button("⬇️ Descargar tabla CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=name, mime="text/csv")
-
-
-# Navegación guiada por temas. La clasificación es orientativa y revisable.
-TOPICS = {
-    "Todos los temas": [],
-    "Vivienda": ["viviend", "alquiler", "hipotec", "desahuci", "precio de la casa"],
-    "Intención de voto y política": ["voto", "votar", "partido", "electoral", "eleccion", "elección", "gobierno", "polític", "politic", "presidente", "ideolog"],
-    "Problemas de España": ["problema", "preocup", "situación general", "situacion general"],
-    "Economía y empleo": ["econom", "empleo", "trabajo", "paro", "salario", "ingres", "inflaci", "impuesto", "pension"],
-    "Sanidad": ["sanidad", "salud", "médic", "medic", "hospital", "atención primaria"],
-    "Educación": ["educa", "estudi", "universidad", "enseñanza"],
-    "Inmigración": ["inmigra", "extranjero", "migraci"],
-    "Valoración de líderes": ["valoración", "valoracion", "líder", "lider", "conoce ud.", "conocimiento de"],
-    "Sociedad y valores": ["relig", "igualdad", "género", "genero", "familia", "discrimin", "seguridad"],
-    "Otros temas": [],
+# Clasificación editorial por CÓDIGO de pregunta, no por coincidencia de palabras
+# que pueden colocar una pregunta en un tema equivocado.
+CATALOG = {
+ 'A1':('Perfil de los entrevistados','Datos personales','Sexo'),
+ 'A2':('Perfil de los entrevistados','Datos personales','Edad'),
+ '0a':('Perfil de los entrevistados','Origen y nacionalidad','Nacionalidad'),
+ '0b':('Perfil de los entrevistados','Origen y nacionalidad','Origen de la nacionalidad'),
+ '0c':('Perfil de los entrevistados','Origen y nacionalidad','País de nacimiento'),
+ '0d':('Perfil de los entrevistados','Origen y nacionalidad','País de origen (detalle)'),
+ '1':('Vivienda','Caso Maricarmen','Conocimiento del desahucio'),
+ '2':('Vivienda','Caso Maricarmen','Importancia del caso'),
+ '3':('Vivienda','Caso Maricarmen','Prioridades ante un desahucio'),
+ '4':('Vivienda','Medidas del Gobierno','Conocimiento de los decretos'),
+ '4a':('Vivienda','Medidas del Gobierno','Valoración de la medida'),
+ '5':('Vivienda','Medidas del Gobierno','Apoyo a los decretos'),
+ '6a':('Vivienda','Competencias y soluciones','Administración competente'),
+ '6b':('Vivienda','Competencias y soluciones','Quién debería gestionar la vivienda'),
+ '7':('Vivienda','Competencias y soluciones','Prioridades de política de vivienda'),
+ '8':('Medio ambiente y política exterior','Medio ambiente','Preocupación por el cambio climático'),
+ '9':('Medio ambiente y política exterior','Conflictos internacionales','Preocupación por Ucrania'),
+ '10':('Medio ambiente y política exterior','Conflictos internacionales','Preocupación por Oriente Próximo'),
+ '11':('Economía','Situación económica','Economía personal'),
+ '12':('Economía','Situación económica','Economía española'),
+ '13R':('Problemas y preocupaciones','Problemas del país','Principales problemas de España'),
+ '14R':('Problemas y preocupaciones','Problemas personales','Problemas que más afectan'),
+ '15R':('Líderes políticos','Preferencia de presidente','Presidente preferido'),
+ '15Ra':('Líderes políticos','Preferencia de presidente','Presidente preferido (voto definido)'),
+ '16':('Elecciones y voto','Participación electoral','Probabilidad de votar'),
+ '17R':('Elecciones y voto','Intención de voto','Intención directa de voto'),
+ '18R':('Elecciones y voto','Intención de voto','Segunda opción de voto'),
+ '19R':('Elecciones y voto','Simpatía política','Simpatía por partidos'),
+ '19a':('Elecciones y voto','Simpatía política','Voto más simpatía'),
+ '19aR':('Elecciones y voto','Simpatía política','Voto más simpatía (voto definido)'),
+ '20':('Líderes políticos','Conocimiento y valoración','Conocimiento de líderes'),
+ '20a':('Líderes políticos','Conocimiento y valoración','Valoración de líderes (1–10)'),
+ '21':('Líderes políticos','Confianza','Confianza en Pedro Sánchez'),
+ '22':('Líderes políticos','Confianza','Confianza en Alberto Núñez Feijóo'),
+ '23':('Líderes políticos','Gobierno y ministros','Conocimiento de ministros'),
+ '23a':('Líderes políticos','Gobierno y ministros','Valoración de ministros'),
+ '24':('Elecciones y voto','Recuerdo electoral','Participación en 2023'),
+ '24aR':('Elecciones y voto','Recuerdo electoral','Voto en las generales de 2023'),
+ '24aa':('Elecciones y voto','Recuerdo electoral','Participación y voto en 2023'),
+ '25':('Elecciones y voto','Fidelidad y cambio de voto','¿Repetiría su voto?'),
+ '26R':('Elecciones y voto','Identificación partidista','Partido más cercano'),
+ '26Ra':('Elecciones y voto','Identificación partidista','Partido más cercano (voto definido)'),
+ '27':('Elecciones y voto','Fidelidad y cambio de voto','Fidelidad a un partido'),
+ '28':('Elecciones y voto','Fidelidad y cambio de voto','Cuándo decide su voto'),
+ '29R':('Elecciones y voto','Intención de voto','Intención de voto autonómico'),
+ '30':('Ideología','Autoubicación ideológica','Posición izquierda–derecha'),
+ '31':('Perfil de los entrevistados','Educación','Escolarización'),
+ '31a':('Perfil de los entrevistados','Educación','Nivel educativo alcanzado'),
+ '31aa':('Perfil de los entrevistados','Educación','Nivel de estudios (agrupado)'),
+ '32':('Sociedad y valores','Religión','Identificación religiosa'),
+ '32a':('Sociedad y valores','Religión','Práctica religiosa'),
+ '33':('Perfil de los entrevistados','Datos personales','Estado civil'),
+ '34':('Trabajo y clase social','Empleo','Situación laboral'),
+ '34a':('Trabajo y clase social','Empleo','Tipo de trabajo'),
+ '34b':('Trabajo y clase social','Empleo','Ocupación'),
+ '34ba':('Trabajo y clase social','Empleo','Población activa e inactiva'),
+ '35':('Economía','Ingresos','Ingresos del hogar'),
+ '36':('Trabajo y clase social','Clase social','Clase social declarada'),
+ '36a':('Trabajo y clase social','Clase social','Clase social (agrupada)'),
 }
-PARTIES = ["TOTAL", "PSOE", "PP", "VOX", "Sumar", "Podemos", "ERC", "Junts", "EH Bildu", "PNV"]
-# Agrupaciones convencionales, NO equivalen a autoubicación ideológica.
-PARTY_GROUPS = {"Izquierda (partidos)": ["PSOE", "Sumar", "Podemos", "ERC", "EH Bildu"],
-                "Derecha (partidos)": ["PP", "VOX", "Junts", "PNV"]}
 
-def topic_for(block):
-    title = (block["code"] + " " + block["title"]).casefold()
-    for topic, words in TOPICS.items():
-        if topic not in ("Todos los temas", "Otros temas") and any(w in title for w in words):
-            return topic
-    return "Otros temas"
+def meta(block):
+    return CATALOG.get(block['code'],('Otros temas','Otras preguntas', clean(block['title'])[:60] or block['code']))
 
-def available_questions(data, sheet, topic, search):
-    blocks = data[sheet]["blocks"]
-    hits = [(i, b) for i, b in enumerate(blocks)
-            if (topic == "Todos los temas" or topic_for(b) == topic)
-            and search.casefold().strip() in (b["code"] + " " + b["title"]).casefold()]
-    return hits
+PALETTE=['#3563e9','#dd8080','#97a3b7','#22a699','#e8b455','#9c7ad7','#6c9bd1','#d26f9d','#74888b','#d4b58a']
+PARTY_LIST=['PSOE','PP','VOX','Sumar','Podemos','ERC','Junts','EH Bildu','PNV']
 
-def pick_columns(block, sheet, mode, party, ideology, extra):
-    cols = [c for c in block["table"].columns if c != "Respuesta"]
-    if mode == "Partidos (recuerdo de voto)" and sheet == "RV EG23":
-        if party == "Todos los partidos":
-            proposed = [x for x in PARTIES if x in cols]
-        elif party in PARTY_GROUPS:
-            proposed = [x for x in PARTY_GROUPS[party] if x in cols]
-        else:
-            proposed = [party] if party in cols else []
-    elif mode == "Autoubicación ideológica (escala CIS)" and sheet == "Escala de ideología":
-        import unicodedata
-        def score(c):
-            s = str(c).strip()
-            m = re.match(r"^(\d{1,2})(?:\s|$|[.:-])", s)
-            return int(m.group(1)) if m else None
-        ranges = {"Todos": range(1,11), "Izquierda (1–4)": range(1,5),
-                  "Centro (5–6)": range(5,7), "Derecha (7–10)": range(7,11)}
-        proposed = [c for c in cols if score(c) in ranges[ideology]]
-    else:
-        proposed = cols[:8]
-    return [c for c in proposed if c in cols]
+def e(x): return html.escape(str(x),quote=True)
 
-st.title("📊 Observatorio CIS")
-st.caption("Panel de análisis · Temas, partidos y gráficos · Versión 4.1")
-st.info("Resultados agregados oficiales. Los porcentajes proceden de las tablas publicadas por el CIS; no son microdatos ni estimaciones propias.")
+def pct(x):return f'{float(x):.1f}'.replace('.',',')+' %'
+
+def bar_single(labels,values):
+    parts=[]
+    for i,(label,v) in enumerate(zip(labels,values)):
+        if pd.isna(v):continue
+        v=float(v)
+        width=max(0,min(100,v))
+        parts.append(f'<div class="barrow"><div class="barlabel"><span>{e(label)}</span><b>{pct(v)}</b></div><div class="track"><div class="fill" style="width:{width:.3f}%;background:{PALETTE[i%len(PALETTE)]}"></div></div></div>')
+    return '<div class="viz">'+''.join(parts)+'</div>'
+
+def bar_stacked(view,groups,answers):
+    parts=[]
+    for group in groups:
+        vals=[pd.to_numeric(view.loc[view['Respuesta']==a,group],errors='coerce').iloc[0] for a in answers]
+        total=sum(float(v) for v in vals if pd.notna(v) and v>=0)
+        # Never silently renormalize published values. Show raw segments only if compatible.
+        if not 98<=total<=102:
+            parts.append(f'<div class="barrow"><div class="barlabel"><span>{e(group)}</span><small>No suma 100 % ({pct(total)}). Usa barras individuales.</small></div></div>')
+            continue
+        parts.append(f'<div class="barrow"><div class="barlabel"><span>{e(group)}</span><b>{pct(total)}</b></div><div class="stack">')
+        for i,v in enumerate(vals):
+            if pd.isna(v) or v<=0:continue
+            w=float(v)
+            txt=pct(w) if w>=12 else ''
+            parts.append(f'<div class="segment" style="width:{w:.4f}%;background:{PALETTE[i%len(PALETTE)]}" title="{e(answers[i])}: {pct(w)}">{e(txt)}</div>')
+        parts.append('</div></div>')
+    legend=''.join(f'<span class="legenditem"><i style="background:{PALETTE[i%len(PALETTE)]}"></i>{e(a)}</span>' for i,a in enumerate(answers))
+    return '<div class="viz">'+''.join(parts)+f'<div class="legend">{legend}</div></div>'
+
+def heatmap(view,groups,answers):
+    values=[]
+    for a in answers:
+        r=view[view['Respuesta']==a]
+        if r.empty:continue
+        values.append((a,[pd.to_numeric(r[g],errors='coerce').iloc[0] for g in groups]))
+    maxv=max([float(v) for _,row in values for v in row if pd.notna(v)] or [100])
+    maxv=max(maxv,1)
+    head='<div class="heatgrid" style="--cols:'+str(len(answers))+'"><div class="heathead"></div>'+''.join('<div class="heathead">'+e(a)+'</div>' for a in answers)
+    rows=[]
+    for group in groups:
+        rows.append('<div class="heatrowlabel">'+e(group)+'</div>')
+        for a in answers:
+            r=view[view['Respuesta']==a]
+            v=pd.to_numeric(r[group],errors='coerce').iloc[0] if not r.empty else float('nan')
+            if pd.isna(v):rows.append('<div class="heatcell empty">—</div>');continue
+            alpha=.14+.78*max(0,min(1,float(v)/maxv))
+            rows.append(f'<div class="heatcell" style="background:rgba(53,99,233,{alpha:.3f})" title="{e(group)} · {e(a)}: {pct(v)}">{pct(v)}</div>')
+    return '<div class="heatwrap">'+head+''.join(rows)+'</div></div>'
+
+st.markdown('''<style>
+.landing{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:22px 0}.landingcard{border:1px solid rgba(145,158,180,.28);border-radius:16px;padding:20px;display:flex;flex-direction:column;gap:8px}.landingcard span{color:#9ca3af;font-size:.85rem}.block-container{max-width:1020px;padding-top:1.4rem;padding-bottom:4rem}
+h1{letter-spacing:-.045em}h2,h3{letter-spacing:-.025em}
+[data-testid="stMetric"]{border:1px solid rgba(130,145,170,.2);border-radius:14px;padding:12px}
+.viz{border:1px solid rgba(145,158,180,.24);border-radius:18px;padding:20px;margin:10px 0 18px}
+.barrow{margin:0 0 20px}.barrow:last-child{margin-bottom:0}
+.barlabel{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:7px;font-size:1rem}
+.barlabel b{white-space:nowrap;font-size:1.05rem}.barlabel small{font-size:.75rem;color:#9ca3af}
+.track{height:15px;background:rgba(150,160,175,.20);border-radius:7px;overflow:hidden}
+.fill{height:100%;border-radius:7px}.stack{height:38px;display:flex;border-radius:8px;overflow:hidden;background:rgba(150,160,175,.13)}
+.segment{display:flex;align-items:center;justify-content:center;color:white;font-size:.83rem;font-weight:700;white-space:nowrap;overflow:hidden}
+.legend{display:flex;gap:10px 18px;flex-wrap:wrap;margin-top:18px;font-size:.8rem}.legenditem{display:flex;align-items:center;gap:6px}
+.legenditem i{display:inline-block;width:11px;height:11px;border-radius:3px}
+.heatwrap{overflow-x:auto;max-width:100%;padding-bottom:10px}.heatgrid{display:grid;grid-template-columns:110px repeat(var(--cols),minmax(90px,1fr));gap:5px;min-width:max-content}
+.heathead{text-align:center;font-size:.76rem;font-weight:700;padding:8px 4px;max-width:135px;overflow-wrap:anywhere}
+.heatrowlabel{display:flex;align-items:center;font-size:.84rem;padding:6px;max-width:110px;overflow-wrap:anywhere}
+.heatcell{min-height:51px;display:flex;align-items:center;justify-content:center;border-radius:7px;color:#fff;font-size:.85rem;font-weight:700}
+.heatcell.empty{background:rgba(150,160,175,.12);color:#aaa}
+@media(max-width:640px){.block-container{padding-left:1rem;padding-right:1rem}.viz{padding:14px}.stack{height:34px}.barlabel{font-size:.92rem}.heatgrid{grid-template-columns:90px repeat(var(--cols),minmax(85px,1fr))}}
+</style>''',unsafe_allow_html=True)
+
+st.title('📊 Observatorio CIS')
+st.caption('Datos oficiales · Panel temático · Versión 7.0')
 if not DATA_DIR.exists():
-    st.error("No se encuentra la carpeta Datos/ del repositorio.")
-    st.stop()
-studies = sorted(p for p in DATA_DIR.glob("*.xlsx") if p.is_file() and not p.is_symlink()
-                 and not p.name.startswith("~$") and p.stat().st_size <= 30 * 1024 * 1024)
-if not studies:
-    st.error("No hay archivos Excel .xlsx en la carpeta Datos/.")
-    st.stop()
-study = st.selectbox("📁 Estudio del CIS", studies, format_func=lambda p: p.stem)
+    st.error('Falta la carpeta Datos junto a app.py.');st.stop()
+files=sorted(p for p in DATA_DIR.glob('*.xlsx') if p.is_file() and not p.is_symlink() and not p.name.startswith('~$') and p.stat().st_size<=30*1024*1024)
+if not files:
+    st.error('No se encontraron estudios Excel en Datos/.');st.stop()
+with st.sidebar:
+    st.markdown('### Estudios')
+    file=st.selectbox('Barómetro',files,format_func=lambda p:p.stem)
+    st.caption('Los datos del repositorio privado se muestran solo a usuarios autorizados de la aplicación.')
 try:
-    content = parse_study(study.read_bytes())
+    data=parse_study(file.read_bytes())
 except Exception:
-    st.error("No se pudo leer el Excel. Consulta los registros privados de Streamlit.")
-    st.stop()
-st.success(f"Estudio disponible: {study.stem} · {len(content)} hojas")
+    st.error('No se pudo interpretar el Excel. Consulta los registros de Streamlit.');st.stop()
+if not data:
+    st.warning('No hay preguntas reconocidas.');st.stop()
+reference=data.get('Resultados') or next(iter(data.values()))
 
-st.subheader("Filtros de análisis")
-topic = st.selectbox("1. Tema general", list(TOPICS))
-search = st.text_input("Buscar dentro del tema (opcional)", placeholder="Ej.: vivienda, conoce, voto…")
-mode = st.selectbox("2. ¿Cómo quieres desglosar las respuestas?", [
-    "Partidos (recuerdo de voto)", "Autoubicación ideológica (escala CIS)",
-    "Sexo", "Edad", "Nivel de estudios", "Tamaño de municipio", "Ocupación", "Clase social", "Religiosidad", "Total general"])
-party = "Todos los partidos"
-ideology = "Todos"
-if mode == "Partidos (recuerdo de voto)":
-    party = st.selectbox("3. Partido o bloque político", ["Todos los partidos", "PSOE", "PP", "VOX", "Sumar", "Podemos", "ERC", "Junts", "EH Bildu", "PNV", "Izquierda (partidos)", "Derecha (partidos)"])
-    st.caption("Las agrupaciones por partidos son orientativas. No equivalen a la autoubicación ideológica de los entrevistados y no se suman sus porcentajes.")
-elif mode == "Autoubicación ideológica (escala CIS)":
-    ideology = st.selectbox("3. Bloque ideológico", ["Todos", "Izquierda (1–4)", "Centro (5–6)", "Derecha (7–10)"])
-    st.caption("Se seleccionan columnas de la escala de ideología; no se agregan porcentajes de diferentes columnas como si fueran un único grupo.")
+PAGES=[
+    ('🏠 Vivienda','Vivienda'),('🗳️ Elecciones','Elecciones y voto'),
+    ('👤 Líderes','Líderes políticos'),('💶 Economía','Economía'),
+    ('⚖️ Ideología','Ideología'),('📋 Problemas','Problemas y preocupaciones'),
+    ('👥 Sociedad','Sociedad y valores'),('💼 Trabajo','Trabajo y clase social'),
+    ('🎓 Perfil','Perfil de los entrevistados'),('🌍 Internacional','Medio ambiente y política exterior'),
+]
 
-sheet = {"Partidos (recuerdo de voto)": "RV EG23", "Autoubicación ideológica (escala CIS)": "Escala de ideología",
-         "Total general": "Resultados"}.get(mode, mode)
-if sheet not in content or not content[sheet]["blocks"]:
-    st.warning("Este estudio no tiene tablas utilizables para el desglose seleccionado.")
+# Each topic is a genuine navigation page in the sidebar rather than a topic selector.
+with st.sidebar:
+    st.markdown('### Páginas')
+    choices=['📊 Gráficos','🔄 Trasvases','🌡️ Mapas de calor','🏡 Inicio']+[label for label,topic in PAGES if any(meta(b)[0]==topic for b in reference)]+['📚 Estudios']
+    page=st.radio('Navegación',choices,label_visibility='collapsed',key='navpage')
+
+if page=='🏡 Inicio':
+    st.header('Explora el CIS por temas')
+    st.write('Elige una página en el menú lateral ☰. Dentro encontrarás subtemas e indicadores con nombres breves. La pregunta oficial está disponible al desplegar su ficha.')
+    st.markdown('<div class="landing">'+''.join(f'<div class="landingcard"><b>{e(label)}</b><span>{sum(meta(b)[0]==topic for b in reference)} indicadores</span></div>' for label,topic in PAGES if any(meta(b)[0]==topic for b in reference))+'</div>',unsafe_allow_html=True)
+    st.info('Los gráficos usan los porcentajes publicados. No se infieren entrevistas individuales ni se generan estimaciones propias.')
     st.stop()
-hits = available_questions(content, sheet, topic, search)
-st.caption(f"{len(hits)} preguntas o bloques encontrados · Desglose: {sheet}")
-if not hits:
-    st.warning("No hay preguntas de ese tema en el desglose seleccionado. Prueba «Todos los temas» o cambia la búsqueda.")
+
+if page=='📚 Estudios':
+    st.header('Estudios disponibles')
+    for f in files:st.write('📄',f.stem)
+    st.write('Hojas reconocidas:',', '.join(data))
+    st.info('Para añadir un estudio, sube otro .xlsx a Datos/ en GitHub. No incluyas modelos privados ni claves en el repositorio.')
     st.stop()
-idx = st.selectbox("4. Pregunta", [i for i, _ in hits],
-                   format_func=lambda i: f'{content[sheet]["blocks"][i]["code"]} · {content[sheet]["blocks"][i]["title"][:145]}')
-b = content[sheet]["blocks"][idx]
-st.caption(f"Fuente: {sheet} · {b['code']} · {b['title']}")
-proposed = pick_columns(b, sheet, mode, party, ideology, None)
-if not proposed:
-    st.warning("No hay columnas disponibles para ese filtro en esta pregunta. Selecciona otro partido o desglose.")
+
+if page=='🔄 Trasvases':
+    st.header('Trasvases electorales')
+    st.caption('Intención declarada por recuerdo de voto de 2023. Son porcentajes condicionados publicados, no flujos absolutos de personas.')
+    b=next((b for b in data.get('RV EG23',[]) if b['code']=='17R'),None)
+    if b is None:
+        st.warning('Este estudio no tiene la tabla cruzada necesaria.');st.stop()
+    available=[c for c in b['table'].columns if c not in ('Respuesta','TOTAL')]
+    origins=st.multiselect('Voto en 2023',available,default=[x for x in ['PSOE','PP','VOX','Sumar'] if x in available])
+    destinations=b['table']['Respuesta'].astype(str).tolist()
+    dests=st.multiselect('Intención actual',destinations,default=[x for x in destinations if norm(x) in ('psoe','pp','vox','sumar')])
+    if origins and dests:
+        st.markdown(heatmap(b['table'],origins,dests),unsafe_allow_html=True)
+        st.download_button('Descargar matriz CSV',b['table'][b['table']['Respuesta'].isin(dests)][['Respuesta']+origins].to_csv(index=False).encode('utf-8-sig'),'trasvases.csv','text/csv')
     st.stop()
-cols = st.multiselect("5. Columnas a comparar", [c for c in b["table"].columns if c != "Respuesta"],
-                      default=proposed[:10])
-if not cols:
-    st.info("Selecciona al menos una columna.")
-    st.stop()
-view = numeric_view(b, cols)
-chart = st.selectbox("6. Visualización", ["Barras horizontales apiladas", "Mapa de calor", "Barras comparativas", "Tabla de porcentajes", "Trasvases de voto"])
-if chart == "Barras horizontales apiladas":
-    answers = st.multiselect("Respuestas", view["Respuesta"].astype(str).tolist(), default=view["Respuesta"].astype(str).tolist()[:12])
-    selected = view[view["Respuesta"].astype(str).isin(answers)].reset_index(drop=True)
-    if not selected.empty:
-        st.caption("Los porcentajes son los publicados. En preguntas de respuesta múltiple las barras pueden sumar más del 100 %.")
-        plot_stacked(selected, cols, b["title"], normalize=False)
-elif chart == "Mapa de calor":
-    answers = st.multiselect("Respuestas", view["Respuesta"].astype(str).tolist(), default=view["Respuesta"].astype(str).tolist()[:18])
-    selected = view[view["Respuesta"].astype(str).isin(answers)].reset_index(drop=True)
-    if not selected.empty:
-        plot_heatmap(selected, cols)
-elif chart == "Barras comparativas":
-    long = view.melt(id_vars="Respuesta", value_vars=cols, var_name="Grupo", value_name="Porcentaje")
-    fig = px.bar(long, x="Porcentaje", y="Respuesta", color="Grupo", barmode="group", orientation="h")
-    fig.update_layout(height=max(440, len(view)*30 + 160))
-    st.plotly_chart(fig, use_container_width=True)
-elif chart == "Tabla de porcentajes":
-    st.dataframe(view.round(2), use_container_width=True, hide_index=True)
-else:
-    st.caption("Trasvases calculados únicamente a partir de la pregunta 17R de la hoja RV EG23 cuando esté disponible.")
-    candidates = [q for q in content.get("RV EG23", {}).get("blocks", []) if re.search(r"^Pregunta\s+17R\b", q["code"], re.I)]
-    if not candidates:
-        st.warning("No se ha encontrado el cruce de intención actual y recuerdo de voto necesario para el trasvase.")
-    else:
-        flow_b = candidates[0]
-        table = flow_b["table"]
-        origins = [x for x in ["PSOE", "PP", "VOX", "Sumar"] if x in table.columns and pd.notna(flow_b["bases"].get(x))]
-        origins = st.multiselect("Partidos de origen (2023)", [c for c in table.columns if c != "Respuesta" and c != "TOTAL" and pd.notna(flow_b["bases"].get(c))], default=origins)
-        dests = st.multiselect("Respuestas de destino", table["Respuesta"].astype(str).tolist(), default=[x for x in table["Respuesta"].astype(str) if x.casefold() in ("psoe", "pp", "vox", "sumar")])
-        flows=[]
-        for origin in origins:
-            base=float(flow_b["bases"][origin])
-            for _, r in table.iterrows():
-                if str(r["Respuesta"]) not in dests: continue
-                pct=pd.to_numeric(r[origin],errors="coerce")
-                if pd.notna(pct) and pct>0:
-                    flows.append((origin,str(r["Respuesta"]),base*float(pct)/100,float(pct)))
-        if flows:
-            names=["2023 · "+x for x in origins]+["Actual · "+x for x in dests]
-            fig=go.Figure(go.Sankey(node=dict(label=names),link=dict(
-                source=[origins.index(x[0]) for x in flows],target=[len(origins)+dests.index(x[1]) for x in flows],
-                value=[x[2] for x in flows],customdata=[x[3] for x in flows],
-                hovertemplate="Base ponderada aproximada: %{value:.1f}<br>% del origen: %{customdata:.1f}<extra></extra>")))
-            fig.update_layout(height=560)
-            st.plotly_chart(fig,use_container_width=True)
-            st.warning("Flujos aproximados basados en bases ponderadas publicadas. Los destinos omitidos no se muestran. No es una predicción ni un modelo propio.")
+
+# Visualización por tipo: estas son las tres páginas principales del menú.
+if page in ('📊 Gráficos','🌡️ Mapas de calor'):
+    st.header(page)
+    st.caption('Selecciona un tema, un subtema y un indicador. La pregunta original se muestra aparte.')
+    available_topics=[(label,topic) for label,topic in PAGES if any(meta(b)[0]==topic for b in reference)]
+    labels=[label for label,_ in available_topics]
+    chosen_topic=st.selectbox('Tema',labels,key='viz_topic')
+    topic_name=dict(available_topics)[chosen_topic]
+    items=[b for b in reference if meta(b)[0]==topic_name]
+    sub=st.selectbox('Subtema',sorted({meta(b)[1] for b in items}),key='viz_sub')
+    items=[b for b in items if meta(b)[1]==sub]
+    codes=[b['code'] for b in items]
+    qcode=st.selectbox('Indicador',codes,format_func=lambda code:next((meta(b)[2] for b in items if b['code']==code),code),key='viz_indicator')
+    selected=next(b for b in items if b['code']==qcode)
+    st.subheader(meta(selected)[2])
+    with st.expander('Leer pregunta original del CIS'):
+        st.write(selected['title'] or 'Enunciado no disponible en el Excel')
+        st.caption('Código '+qcode+' · Estudio '+file.stem)
+    MODES_VIZ={'Total':'Resultados','Por partido (voto en 2023)':'RV EG23','Por edad':'Edad','Por sexo':'Sexo','Por estudios':'Nivel de estudios','Por ideología':'Escala de ideología','Por clase social':'Clase social','Por ocupación':'Ocupación','Por religiosidad':'Religiosidad','Por tamaño de municipio':'Tamaño de municipio'}
+    valid={label:sheet for label,sheet in MODES_VIZ.items() if sheet in data and any(b['code']==qcode for b in data[sheet])}
+    if not valid:
+        st.info('No existe un desglose publicado para este indicador.');st.stop()
+    mode=st.selectbox('Comparar por',list(valid),index=0 if len(valid)==1 else 1,key='viz_mode')
+    b=next(b for b in data[valid[mode]] if b['code']==qcode)
+    columns=[c for c in b['table'].columns if c!='Respuesta']
+    if valid[mode]=='RV EG23':
+        party=st.selectbox('Partido o bloque',['Todos','Izquierda (partidos)','Derecha (partidos)']+[c for c in PARTY_LIST if c in columns],key='viz_party')
+        if party=='Todos': defaults=[c for c in PARTY_LIST if c in columns][:5]
+        elif party.startswith('Izquierda'):defaults=[c for c in ['PSOE','Sumar','Podemos','ERC','EH Bildu'] if c in columns]
+        elif party.startswith('Derecha'):defaults=[c for c in ['PP','VOX'] if c in columns]
+        else:defaults=[party]
+        st.caption('Los bloques son selecciones de partidos, no sumas estadísticas de porcentajes.')
+    else:defaults=columns[:min(5,len(columns))]
+    groups=st.multiselect('Grupos que quieres mostrar',columns,default=defaults,key='viz_groups')
+    if not groups:
+        st.info('Selecciona al menos un grupo.');st.stop()
+    view=b['table'][['Respuesta']+groups].copy()
+    answers=view['Respuesta'].astype(str).tolist()
+    if not answers:
+        st.info('No hay respuestas disponibles.');st.stop()
+    if page=='📊 Gráficos':
+        chart=st.radio('Tipo de gráfico',['Barras horizontales','Barras apiladas'],horizontal=True,key='viz_chart')
+        if chart=='Barras horizontales':
+            answer=st.selectbox('Respuesta que quieres comparar',answers,key='viz_answer')
+            row=view.loc[view['Respuesta'].astype(str)==answer].iloc[0]
+            st.markdown(bar_single(groups,[row[g] for g in groups]),unsafe_allow_html=True)
         else:
-            st.info("Selecciona al menos un origen y un destino con datos disponibles.")
+            chosen=st.multiselect('Respuestas que quieres representar',answers,default=answers[:min(5,len(answers))],key='viz_answers')
+            if chosen:st.markdown(bar_stacked(view,groups,chosen),unsafe_allow_html=True)
+            st.caption('Las barras apiladas solo representan el 100 % cuando las categorías son exhaustivas y excluyentes.')
+    else:
+        chosen=st.multiselect('Respuestas (columnas del mapa)',answers,default=answers[:min(4,len(answers))],key='viz_heat_answers')
+        if chosen:st.markdown(heatmap(view,groups,chosen),unsafe_allow_html=True)
+        st.caption('Desliza horizontalmente para ver todas las columnas en el móvil.')
+    st.download_button('⬇️ Descargar datos CSV',view.to_csv(index=False).encode('utf-8-sig'),f'cis_{file.stem}_{qcode}.csv','text/csv',key='viz_csv')
+    st.stop()
 
-csv_button(view, "observatorio_cis_seleccion.csv")
-with st.expander("Metodología, límites y seguridad"):
-    st.markdown("""Los temas se clasifican mediante palabras clave; revisa la pregunta exacta antes de interpretar. Las tablas son agregadas, no microdatos. No se suman porcentajes de partidos para obtener una ideología conjunta. Para un agregado ponderado válido harían falta bases compatibles y un cálculo específico. La aplicación solo lee archivos Excel del directorio autorizado, limita su tamaño y no ejecuta macros. Los modelos privados de estimación no deben guardarse en este repositorio.""")
+topic=dict(PAGES)[page]
+st.header(page)
+st.caption('Estudio '+file.stem+' · Resultados oficiales publicados')
+items=[b for b in reference if meta(b)[0]==topic]
+if not items:
+    st.warning('No hay indicadores disponibles en este tema.');st.stop()
+subtopics=sorted({meta(b)[1] for b in items})
+sub=st.selectbox('Subtema',subtopics)
+items=[b for b in items if meta(b)[1]==sub]
+qcode=st.selectbox('Indicador',[b['code'] for b in items],format_func=lambda code:next((meta(b)[2] for b in items if b['code']==code),code))
+selected=next(b for b in items if b['code']==qcode)
+st.subheader(meta(selected)[2])
+with st.expander('Ver la pregunta original del CIS'):
+    st.write(selected['title'] or 'Enunciado no disponible en el Excel')
+    st.caption('Código '+qcode+' · Estudio '+file.stem)
+
+MODES={'Total':'Resultados','Por partido (voto en 2023)':'RV EG23','Por edad':'Edad','Por sexo':'Sexo','Por estudios':'Nivel de estudios','Por ideología':'Escala de ideología','Por clase social':'Clase social','Por ocupación':'Ocupación','Por religiosidad':'Religiosidad','Por tamaño de municipio':'Tamaño de municipio'}
+valid={label:sheet for label,sheet in MODES.items() if sheet in data and any(b['code']==qcode for b in data[sheet])}
+if not valid:
+    st.warning('El Excel no ofrece un desglose para este indicador.');st.stop()
+mode=st.selectbox('Comparar por',list(valid),index=0)
+sheet=valid[mode]
+b=next(b for b in data[sheet] if b['code']==qcode)
+cols=[c for c in b['table'].columns if c!='Respuesta']
+if sheet=='RV EG23':
+    party_options=['Todos','Izquierda (partidos)','Derecha (partidos)']+[c for c in PARTY_LIST if c in cols]
+    party=st.selectbox('Partido / bloque',party_options)
+    if party=='Todos':default=[c for c in PARTY_LIST if c in cols][:5]
+    elif party.startswith('Izquierda'):default=[c for c in ['PSOE','Sumar','Podemos','ERC','EH Bildu'] if c in cols]
+    elif party.startswith('Derecha'):default=[c for c in ['PP','VOX'] if c in cols]
+    else:default=[party]
+    st.caption('Izquierda y derecha son selecciones de partidos para comparar, no porcentajes agregados.')
+else:default=cols[:min(5,len(cols))]
+groups=st.multiselect('Grupos visibles',cols,default=default)
+if not groups:
+    st.info('Selecciona al menos un grupo.');st.stop()
+view=b['table'][['Respuesta']+groups].copy()
+answers=view['Respuesta'].astype(str).tolist()
+if not answers:
+    st.info('No hay respuestas en esta pregunta.');st.stop()
+chart=st.segmented_control('Visualización',['Barras','Apiladas','Mapa de calor','Tabla'],default='Barras')
+if chart=='Barras':
+    answer=st.selectbox('Respuesta',answers)
+    row=view.loc[view['Respuesta'].astype(str)==answer].iloc[0]
+    st.markdown(bar_single(groups,[row[g] for g in groups]),unsafe_allow_html=True)
+elif chart=='Apiladas':
+    chosen=st.multiselect('Respuestas',answers,default=answers[:min(5,len(answers))])
+    if chosen:st.markdown(bar_stacked(view,groups,chosen),unsafe_allow_html=True)
+    st.caption('Solo se apilan categorías que sumen aproximadamente el 100 %; no se modifican los porcentajes oficiales.')
+elif chart=='Mapa de calor':
+    chosen=st.multiselect('Respuestas',answers,default=answers[:min(4,len(answers))])
+    if chosen:st.markdown(heatmap(view,groups,chosen),unsafe_allow_html=True)
+else:
+    st.dataframe(view,use_container_width=True,hide_index=True)
+st.download_button('⬇️ Descargar tabla CSV',view.to_csv(index=False).encode('utf-8-sig'),f'cis_{file.stem}_{qcode}.csv','text/csv')
+with st.expander('Notas metodológicas'):
+    st.write('Los valores son los porcentajes publicados por el CIS. Las respuestas múltiples pueden sumar más del 100 %. No se calculan estimaciones propias ni pruebas estadísticas con estas tablas agregadas. Los nombres breves son etiquetas editoriales: consulta el enunciado original para interpretar cada indicador.')
