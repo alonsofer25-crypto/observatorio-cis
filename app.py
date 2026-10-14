@@ -20,7 +20,7 @@ study = st.selectbox("Selecciona un estudio del CIS", studies, format_func=lambd
 raw = study.read_bytes()
 
 
-@st.cache_data(show_spinner='Leyendo el archivo…')
+
 def load_xlsx(data):
     return pd.ExcelFile(io.BytesIO(data))
 
